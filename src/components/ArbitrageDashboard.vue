@@ -335,7 +335,6 @@ function handleWsPriceChange(change) {
   if (marketPrice === undefined || isNaN(marketPrice)) return
 
   const priceNum = Number(Math.max(0.01, Math.min(0.99, marketPrice)).toFixed(3))
-  const oppPriceNum = Number((1.0 - priceNum).toFixed(3))
   const symbol = pairMeta.symbol
 
   if (!polymarketData.value[symbol]) {
@@ -351,11 +350,9 @@ function handleWsPriceChange(change) {
   const current = polymarketData.value[symbol]
   if (pairMeta.outcome === 'UP') {
     current.upPrice = priceNum
-    current.downPrice = oppPriceNum
     triggerFlashTick(symbol, 'up')
   } else {
     current.downPrice = priceNum
-    current.upPrice = oppPriceNum
     triggerFlashTick(symbol, 'down')
   }
   current.updatedAt = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -388,14 +385,42 @@ function triggerFlashTick(symbol, direction) {
   }, 400)
 }
 
-async function fetchPolymarketDataForPair(symbol, windowTsSec) {
-  const slug = `${symbol.toLowerCase()}-updown-15m-${windowTsSec}`
+async function pollPolymarketData() {
+  if (isPollingPolymarket.value) return
+  isPollingPolymarket.value = true
+
   try {
-    const res = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`)
-    if (res.ok) {
-      const data = await res.json()
-      if (data && data.length > 0 && data[0].markets && data[0].markets.length > 0) {
-        const m = data[0].markets[0]
+    const { windowTsSec } = get15mCycleTimes()
+
+    // Dynamic Discovery via Gamma API latest active events
+    let events = []
+    try {
+      const res = await fetch('https://gamma-api.polymarket.com/events?limit=150&order=startDate&ascending=false&closed=false')
+      if (res.ok) {
+        events = await res.json()
+      }
+    } catch (e) {}
+
+    const newData = { ...polymarketData.value }
+
+    for (const symbol of TARGET_PAIRS) {
+      let matchedEvent = events.find((e) => e.slug && e.slug.startsWith(`${symbol.toLowerCase()}-updown-15m-`))
+      let eventObj = matchedEvent
+
+      // Fallback to exact slug query if dynamic discovery missed it
+      if (!eventObj) {
+        try {
+          const slug = `${symbol.toLowerCase()}-updown-15m-${windowTsSec}`
+          const res = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`)
+          if (res.ok) {
+            const data = await res.json()
+            if (data && data.length > 0) eventObj = data[0]
+          }
+        } catch (e) {}
+      }
+
+      if (eventObj && eventObj.markets && eventObj.markets.length > 0) {
+        const m = eventObj.markets[0]
         let prices = m.outcomePrices
         if (typeof prices === 'string') {
           try { prices = JSON.parse(prices) } catch (e) { prices = [] }
@@ -438,49 +463,25 @@ async function fetchPolymarketDataForPair(symbol, windowTsSec) {
           }
         }
 
-        return {
+        const existing = polymarketData.value[symbol]
+        newData[symbol] = {
           symbol,
-          upPrice: Number(upPrice.toFixed(3)),
-          downPrice: Number(downPrice.toFixed(3)),
-          title: data[0].title || m.question || `${symbol} Up or Down 15m`,
+          upPrice: existing?.upPrice ?? Number(upPrice.toFixed(3)),
+          downPrice: existing?.downPrice ?? Number(downPrice.toFixed(3)),
+          title: eventObj.title || m.question || `${symbol} Up or Down 15m`,
+          updatedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+        }
+      } else if (!newData[symbol]) {
+        newData[symbol] = {
+          symbol,
+          upPrice: 0.50,
+          downPrice: 0.50,
+          title: `${symbol} Up or Down 15m`,
           updatedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
         }
       }
     }
-  } catch (e) {
-    // Retain existing
-  }
-  return null
-}
 
-async function pollPolymarketData() {
-  if (isPollingPolymarket.value) return
-  isPollingPolymarket.value = true
-
-  try {
-    const { windowTsSec } = get15mCycleTimes()
-    const promises = TARGET_PAIRS.map((sym) => fetchPolymarketDataForPair(sym, windowTsSec))
-    const results = await Promise.all(promises)
-
-    const newData = { ...polymarketData.value }
-    results.forEach((res, i) => {
-      const pair = TARGET_PAIRS[i]
-      if (res) {
-        // If WS has already updated with newer live ticks, keep the live WS price
-        const current = polymarketData.value[pair]
-        if (!current) {
-          newData[pair] = res
-        }
-      } else if (!newData[pair]) {
-        newData[pair] = {
-          symbol: pair,
-          upPrice: 0.50,
-          downPrice: 0.50,
-          title: `${pair} Up or Down 15m`,
-          updatedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-        }
-      }
-    })
     polymarketData.value = newData
   } catch (e) {
     console.error('Polymarket poll error:', e)
@@ -906,13 +907,13 @@ function clearHistory() {
             <div class="poly-odd-box up-box" :class="{ 'flash-up': flashTickMap[pair]?.up }">
               <div class="odd-label">
                 <span class="direction-icon">▲</span>
-                <span>UP</span>
+                <span>Up</span>
               </div>
               <div class="odd-price">
-                ${{ (polymarketData[pair]?.upPrice ?? 0.50).toFixed(3) }}
+                {{ Math.round((polymarketData[pair]?.upPrice ?? 0.50) * 100) }}&cent;
               </div>
-              <div class="odd-percent">
-                {{ Math.round((polymarketData[pair]?.upPrice ?? 0.50) * 100) }}%
+              <div class="odd-subprice">
+                ${{ (polymarketData[pair]?.upPrice ?? 0.50).toFixed(2) }}
               </div>
             </div>
 
@@ -920,13 +921,13 @@ function clearHistory() {
             <div class="poly-odd-box down-box" :class="{ 'flash-down': flashTickMap[pair]?.down }">
               <div class="odd-label">
                 <span class="direction-icon">▼</span>
-                <span>DOWN</span>
+                <span>Down</span>
               </div>
               <div class="odd-price">
-                ${{ (polymarketData[pair]?.downPrice ?? 0.50).toFixed(3) }}
+                {{ Math.round((polymarketData[pair]?.downPrice ?? 0.50) * 100) }}&cent;
               </div>
-              <div class="odd-percent">
-                {{ Math.round((polymarketData[pair]?.downPrice ?? 0.50) * 100) }}%
+              <div class="odd-subprice">
+                ${{ (polymarketData[pair]?.downPrice ?? 0.50).toFixed(2) }}
               </div>
             </div>
           </div>
